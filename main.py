@@ -1,6 +1,6 @@
 """
-ARISTOSYS FASTAPI BACKEND - SIMPLE & WORKING
-Production API for Aristosys recruitment platform
+ARISTOSYS FASTAPI BACKEND - DIRECT HTTP VERSION
+Uses direct HTTP calls to Supabase to avoid DNS issues
 """
 
 from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, Header
@@ -8,12 +8,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
 from typing import Optional
 import os
+import httpx
 import tempfile
 import fitz
 
 app = FastAPI(title="Aristosys API", version="1.0.0")
 
-# CORS - Allow all origins for now
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -26,16 +27,8 @@ app.add_middleware(
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 
-# Import supabase only if keys exist
-supabase = None
-
-@app.on_event("startup")
-async def startup():
-    global supabase
-    if SUPABASE_URL and SUPABASE_ANON_KEY:
-        from supabase import create_client
-        supabase = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
-        print("✅ Supabase connected successfully")
+# HTTP client
+http_client = httpx.AsyncClient(timeout=30.0)
 
 # Models
 class UserSignup(BaseModel):
@@ -56,71 +49,113 @@ async def root():
 async def health():
     return {
         "status": "healthy",
-        "supabase": "connected" if supabase else "not configured"
+        "supabase_url": SUPABASE_URL,
+        "key_configured": SUPABASE_ANON_KEY is not None
     }
 
 @app.post("/api/auth/signup")
 async def signup(data: UserSignup):
     try:
-        if not supabase:
-            raise HTTPException(500, "Database not configured")
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            raise HTTPException(500, "Supabase not configured")
         
-        response = supabase.auth.sign_up({
+        # Direct HTTP call to Supabase Auth API
+        auth_url = f"{SUPABASE_URL}/auth/v1/signup"
+        
+        headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
             "email": data.email,
             "password": data.password,
-            "options": {
-                "data": {
-                    "full_name": data.full_name or data.email.split("@")[0]
-                }
+            "data": {
+                "full_name": data.full_name or data.email.split("@")[0]
             }
-        })
+        }
         
-        if response.user:
-            return {
-                "success": True,
-                "message": "Account created successfully!",
-                "user": {
-                    "id": response.user.id,
-                    "email": response.user.email
+        print(f"Calling: {auth_url}")
+        
+        response = await http_client.post(auth_url, headers=headers, json=payload)
+        
+        print(f"Response status: {response.status_code}")
+        print(f"Response body: {response.text}")
+        
+        if response.status_code in [200, 201]:
+            result = response.json()
+            if result.get("user"):
+                return {
+                    "success": True,
+                    "message": "Account created successfully!",
+                    "user": {
+                        "id": result["user"]["id"],
+                        "email": result["user"]["email"]
+                    }
                 }
-            }
-        else:
-            raise HTTPException(400, "Signup failed")
-    
-    except Exception as e:
-        error_msg = str(e)
-        print(f"Signup error: {error_msg}")
+        
+        # Handle error response
+        error_data = response.json() if response.status_code != 500 else {}
+        error_msg = error_data.get("msg") or error_data.get("message") or "Signup failed"
         raise HTTPException(400, error_msg)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Signup error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Signup error: {str(e)}")
 
 @app.post("/api/auth/login")
 async def login(data: UserLogin):
     try:
-        if not supabase:
-            raise HTTPException(500, "Database not configured")
+        if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+            raise HTTPException(500, "Supabase not configured")
         
-        response = supabase.auth.sign_in_with_password({
+        # Direct HTTP call to Supabase Auth API
+        auth_url = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
+        
+        headers = {
+            "apikey": SUPABASE_ANON_KEY,
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
             "email": data.email,
             "password": data.password
-        })
+        }
         
-        if response.user and response.session:
-            # Get user company info
-            user_data = supabase.table("users").select("*, companies(*)").eq("id", response.user.id).single().execute()
-            
+        response = await http_client.post(auth_url, headers=headers, json=payload)
+        
+        if response.status_code == 200:
+            result = response.json()
             return {
                 "success": True,
-                "access_token": response.session.access_token,
-                "user": user_data.data if user_data.data else {"id": response.user.id, "email": response.user.email}
+                "access_token": result["access_token"],
+                "user": {
+                    "id": result["user"]["id"],
+                    "email": result["user"]["email"]
+                }
             }
-        else:
-            raise HTTPException(401, "Invalid credentials")
-    
-    except Exception as e:
-        error_msg = str(e)
-        print(f"Login error: {error_msg}")
+        
+        error_data = response.json() if response.status_code != 500 else {}
+        error_msg = error_data.get("error_description") or error_data.get("msg") or "Invalid credentials"
         raise HTTPException(401, error_msg)
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Login error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, f"Login error: {str(e)}")
 
-# Helper function
+@app.on_event("shutdown")
+async def shutdown():
+    await http_client.aclose()
+
+# Helper
 def extract_text_pdf(content: bytes) -> str:
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(content)
