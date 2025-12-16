@@ -1,5 +1,5 @@
 """
-ARISTOSYS FASTAPI BACKEND
+ARISTOSYS FASTAPI BACKEND - FIXED
 Production API for Aristosys recruitment platform
 """
 
@@ -29,19 +29,28 @@ app.add_middleware(
 
 # Config
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")  # For auth operations
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")  # For database operations
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 
-supabase = None
+supabase_auth = None  # For auth operations
+supabase_db = None    # For database operations
 claude_client = None
 deepgram_client = None
 
 @app.on_event("startup")
 async def startup():
-    global supabase, claude_client, deepgram_client
-    if SUPABASE_URL and SUPABASE_KEY:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    global supabase_auth, supabase_db, claude_client, deepgram_client
+    
+    # Auth client with anon key
+    if SUPABASE_URL and SUPABASE_ANON_KEY:
+        supabase_auth = create_client(SUPABASE_URL, SUPABASE_ANON_KEY)
+    
+    # Database client with service key
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY:
+        supabase_db = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    
     if ANTHROPIC_API_KEY:
         claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
     if DEEPGRAM_API_KEY:
@@ -63,10 +72,10 @@ async def get_current_user(authorization: str = Header(None)):
         raise HTTPException(401, "Missing authorization")
     token = authorization.replace("Bearer ", "")
     try:
-        user_response = supabase.auth.get_user(token)
+        user_response = supabase_auth.auth.get_user(token)
         if not user_response or not user_response.user:
             raise HTTPException(401, "Invalid token")
-        user_data = supabase.table("users").select("*, companies(*)").eq("id", user_response.user.id).single().execute()
+        user_data = supabase_db.table("users").select("*, companies(*)").eq("id", user_response.user.id).single().execute()
         return user_data.data
     except Exception as e:
         raise HTTPException(401, f"Auth failed: {str(e)}")
@@ -79,30 +88,57 @@ async def root():
 @app.post("/api/auth/signup")
 async def signup(data: UserSignup):
     try:
-        response = supabase.auth.sign_up({
+        if not supabase_auth:
+            raise HTTPException(500, "Supabase not configured")
+        
+        response = supabase_auth.auth.sign_up({
             "email": data.email,
             "password": data.password,
-            "options": {"data": {"full_name": data.full_name or data.email.split("@")[0]}}
+            "options": {
+                "data": {
+                    "full_name": data.full_name or data.email.split("@")[0]
+                }
+            }
         })
+        
         if response.user:
-            return {"success": True, "message": "Check your email to verify", "user": {"id": response.user.id, "email": response.user.email}}
-        raise HTTPException(400, "Signup failed")
+            return {
+                "success": True,
+                "message": "Account created! Check your email to verify.",
+                "user": {
+                    "id": response.user.id,
+                    "email": response.user.email
+                }
+            }
+        else:
+            raise HTTPException(400, "Signup failed")
+    
     except Exception as e:
         raise HTTPException(400, str(e))
 
 @app.post("/api/auth/login")
 async def login(data: UserLogin):
     try:
-        response = supabase.auth.sign_in_with_password({"email": data.email, "password": data.password})
+        if not supabase_auth or not supabase_db:
+            raise HTTPException(500, "Supabase not configured")
+        
+        response = supabase_auth.auth.sign_in_with_password({
+            "email": data.email,
+            "password": data.password
+        })
+        
         if response.user and response.session:
-            user_data = supabase.table("users").select("*, companies(*)").eq("id", response.user.id).single().execute()
+            user_data = supabase_db.table("users").select("*, companies(*)").eq("id", response.user.id).single().execute()
+            
             return {
                 "success": True,
                 "access_token": response.session.access_token,
                 "refresh_token": response.session.refresh_token,
                 "user": user_data.data
             }
-        raise HTTPException(401, "Invalid credentials")
+        else:
+            raise HTTPException(401, "Invalid credentials")
+    
     except Exception as e:
         raise HTTPException(401, str(e))
 
@@ -113,13 +149,13 @@ async def get_me(user: dict = Depends(get_current_user)):
 @app.get("/api/clients")
 async def get_clients(user: dict = Depends(get_current_user)):
     company_id = user.get("company_id")
-    response = supabase.table("clients").select("*").eq("company_id", company_id).order("name").execute()
+    response = supabase_db.table("clients").select("*").eq("company_id", company_id).order("name").execute()
     return {"clients": response.data}
 
 @app.get("/api/jds")
 async def get_jds(client_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     company_id = user.get("company_id")
-    query = supabase.table("saved_jds").select("*, clients(name)").eq("company_id", company_id)
+    query = supabase_db.table("saved_jds").select("*, clients(name)").eq("company_id", company_id)
     if client_id:
         query = query.eq("client_id", client_id)
     response = query.order("created_at", desc=True).execute()
@@ -128,7 +164,7 @@ async def get_jds(client_id: Optional[str] = None, user: dict = Depends(get_curr
 @app.get("/api/candidates")
 async def get_candidates(jd_id: Optional[str] = None, user: dict = Depends(get_current_user)):
     company_id = user.get("company_id")
-    query = supabase.table("candidates").select("*").eq("company_id", company_id)
+    query = supabase_db.table("candidates").select("*").eq("company_id", company_id)
     if jd_id:
         query = query.eq("jd_id", jd_id)
     response = query.order("created_at", desc=True).execute()
@@ -146,7 +182,7 @@ async def screen_candidate(
     company_id = user.get("company_id")
     
     # Get JD
-    jd = supabase.table("saved_jds").select("*").eq("id", jd_id).eq("company_id", company_id).single().execute()
+    jd = supabase_db.table("saved_jds").select("*").eq("id", jd_id).eq("company_id", company_id).single().execute()
     if not jd.data:
         raise HTTPException(404, "JD not found")
     
@@ -183,7 +219,7 @@ async def screen_candidate(
         "status": "ongoing"
     }
     
-    result = supabase.table("candidates").insert(candidate_data).execute()
+    result = supabase_db.table("candidates").insert(candidate_data).execute()
     
     return {"success": True, "candidate": result.data[0] if result.data else None, "resume_score": resume_score}
 
